@@ -12,6 +12,7 @@ members = [
     "tree-token",
     "admin-controls",
     "kyc-attestation",
+    "species-registry",
 ]
 resolver = "2"
 
