@@ -99,7 +99,10 @@ async function pollContractEvents(): Promise<void> {
       id: event.id,
       ledger: event.ledger,
       ledgerClosedAt: event.ledgerClosedAt,
-      contractId: event.contractId ?? '',
+      contractId:
+        typeof event.contractId === 'string'
+          ? event.contractId
+          : (event.contractId?.toString() ?? ''),
       eventType,
       topicsXdr,
       valueXdr: valueXdr || null,

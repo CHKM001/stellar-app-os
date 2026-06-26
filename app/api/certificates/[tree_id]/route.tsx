@@ -236,7 +236,7 @@ function TreeCertificate({
 
         {/* QR + verification */}
         <View style={S.verifyRow}>
-          <Image src={qrDataUrl} style={S.qrImage} alt="QR code to verify tree on-chain" />
+          <Image src={qrDataUrl} style={S.qrImage} />
           <View style={S.hashBlock}>
             <Text style={S.hashLabel}>Scan to Verify On-Chain</Text>
             <Text style={S.hashValue}>{treeUid}</Text>
@@ -308,7 +308,7 @@ export async function GET(
     />
   );
 
-  return new NextResponse(pdfBuffer, {
+  return new NextResponse(new Uint8Array(pdfBuffer), {
     headers: {
       'Content-Type': 'application/pdf',
       'Content-Disposition': `attachment; filename="certificate-${tree.treeId}.pdf"`,

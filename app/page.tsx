@@ -15,7 +15,14 @@ import {
   CardDescription,
   CardContent,
 } from '@/components/molecules/Card';
-import { OnboardingTour } from '@/components/organisms/OnboardingTour/OnboardingTour';
+import { TransactionHistoryModal } from '@/components/ui/TransactionHistoryModal';
+import { useToast } from '@/hooks/useToast';
+import { useAppTranslation } from '@/hooks/useTranslation';
+
+export default function Page(): JSX.Element {
+  const { t } = useAppTranslation();
+  const { addToast } = useToast();
+  const [showTx, setShowTx] = useState(false);
 
   return (
     <div className="flex min-h-screen flex-col items-center justify-center gap-8 p-8">
