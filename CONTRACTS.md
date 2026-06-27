@@ -37,12 +37,16 @@ Contracts panic with a descriptive string on invalid input. The Stellar SDK surf
 | `"must hold TREE tokens to vote"` | Voter has zero TREE token balance |
 | `"already voted on this proposal"` | Duplicate vote attempt |
 | `"proposal has not passed"` | Attempting to execute a non-passed proposal |
+| `"planting density below minimum for job size"` — Job area meets threshold but density is too low |
+| `"area hectares must be positive"` — `area_hectares ≤ 0` |
 
 ---
 
 ## tree-escrow
 
 State machine: `Funded → Planted → Completed` (or `Funded → Refunded`)
+
+**Minimum Planting Density Rule (#514):** For jobs with `area_hectares` ≥ `job_size_threshold`, the contract enforces a minimum planting density of `min_density` trees per hectare. Small jobs below the threshold are exempt from density rules.
 
 ### `initialize`
 
@@ -53,6 +57,11 @@ One-time setup. Must be called before any other function.
 | Parameter | Type | Description |
 |---|---|---|
 | `admin` | `Address` | Address that will act as verifier/admin |
+| `tree_token` | `Address` | TREE token contract address |
+| `oracle` | `Address` | Oracle address for survival reports |
+| `survival_threshold_percent` | `u32` | Minimum survival rate (0..=100) for Tranche 2 |
+| `min_density` | `i128` | Minimum trees per hectare for large jobs |
+| `job_size_threshold` | `i128` | Minimum job size (hectares) for density rules |
 
 **Returns:** `void`
 
@@ -61,11 +70,24 @@ One-time setup. Must be called before any other function.
 ```bash
 stellar contract invoke \
   --id $CONTRACT_ID --network testnet --source deployer \
-  -- initialize --admin GADMIN...
+  -- initialize \
+    --admin GADMIN... \
+    --tree_token GTREE... \
+    --oracle GORACLE... \
+    --survival_threshold_percent 70 \
+    --min_density 1000 \
+    --job_size_threshold 10
 ```
 
 ```ts
-await client.initialize({ admin: adminAddress });
+await client.initialize({
+  admin: adminAddress,
+  tree_token: treeTokenAddress,
+  oracle: oracleAddress,
+  survival_threshold_percent: 70,
+  min_density: 1000,
+  job_size_threshold: 10,
+});
 ```
 
 ---
@@ -82,6 +104,8 @@ Donor deposits funds into escrow for a specific farmer. Transfers `amount` of `t
 | `farmer` | `Address` | Beneficiary farmer address |
 | `token` | `Address` | SAC token contract address (e.g. USDC) |
 | `amount` | `i128` | Amount in token's smallest unit (must be > 0) |
+| `tree_count` | `i128` | Number of trees to be planted (must be > 0) |
+| `area_hectares` | `i128` | Planting area in hectares (must be > 0) |
 
 **Returns:** `void`
 
@@ -90,6 +114,8 @@ Donor deposits funds into escrow for a specific farmer. Transfers `amount` of `t
 **Errors:**
 - `"amount must be positive"` — `amount ≤ 0`
 - `"active escrow already exists for this farmer"` — farmer already has an open escrow
+- `"planting density below minimum for job size"` — Job area meets threshold but density is too low
+- `"area hectares must be positive"` — `area_hectares ≤ 0`
 
 ```bash
 stellar contract invoke \
@@ -98,7 +124,9 @@ stellar contract invoke \
     --donor GDONOR... \
     --farmer GFARMER... \
     --token GUSDC... \
-    --amount 10000000
+    --amount 10000000 \
+    --tree_count 5000 \
+    --area_hectares 5
 ```
 
 ```ts
@@ -107,6 +135,8 @@ await client.deposit({
   farmer: farmerAddress,
   token: usdcAddress,
   amount: BigInt(10_000_000), // 1 USDC (7 decimals)
+  tree_count: BigInt(5_000),
+  area_hectares: BigInt(5),
 });
 ```
 
