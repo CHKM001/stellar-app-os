@@ -33,6 +33,12 @@ use soroban_sdk::{
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
+/// Tranche 1: 30% at planting
+const TRANCHE_1_BPS: i128 = 3_000;
+/// Tranche 2: 40% at 6-month survival
+const TRANCHE_2_BPS: i128 = 4_000;
+/// Tranche 3: 30% at 1-year milestone
+const TRANCHE_3_BPS: i128 = 3_000;
 /// 10% per progress update in basis points
 const STREAM_BPS: i128 = 1_000;
 const BPS_DENOM: i128 = 10_000;
@@ -49,6 +55,12 @@ const DISPUTE_WINDOW_SECS: u64 = 60 * 60 * 24 * 7;
 /// Maximum slots per batch deposit (Stellar operation limit safety margin)
 const MAX_BATCH_SIZE: u32 = 50;
 
+/// Default minimum planting density (trees per hectare) for large jobs
+const DEFAULT_MIN_DENSITY: i128 = 1_000;
+
+/// Default job size threshold (in hectares) above which density rules apply
+const DEFAULT_JOB_SIZE_THRESHOLD: i128 = 10;
+
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -56,6 +68,7 @@ const MAX_BATCH_SIZE: u32 = 50;
 pub enum EscrowStatus {
     Funded,
     Planted,
+    Survived,
     Completed,
     Refunded,
 }
@@ -69,6 +82,7 @@ pub struct EscrowRecord {
     pub token: Address,
     pub total_amount: i128,
     pub tree_count: i128,
+    pub area_hectares: i128,
     pub verified_tree_count: i128,
     pub tree_tokens_minted: i128,
     pub released: i128,
@@ -78,6 +92,7 @@ pub struct EscrowRecord {
     pub planting_proof: BytesN<32>,
     pub survival_proof: BytesN<32>,
     pub survival_rate_percent: u32,
+    pub year_proof: BytesN<32>,
 }
 
 /// A single slot in a batch deposit: one farmer address and the amount for that tree.
@@ -155,6 +170,26 @@ pub struct TreeFunding {
     pub status: TreeFundingStatus,
 }
 
+/// Sponsor rating for a planter (1-5 stars)
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PlanterRating {
+    pub sponsor: Address,
+    pub farmer: Address,
+    pub rating: u32, // 1-5 stars
+    pub rated_at: u64,
+}
+
+/// Aggregated reputation score for a planter
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PlanterReputation {
+    pub farmer: Address,
+    pub total_ratings: u32,
+    pub sum_ratings: u128, // Sum of all ratings (1-5 each)
+    pub average_rating: u32, // Calculated as sum / total (scaled to 0-100)
+}
+
 // ── Storage keys ──────────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -165,6 +200,10 @@ enum DataKey {
     Oracle,
     /// Minimum oracle-confirmed survival rate (0..=100) to release Tranche 2.
     SurvivalThreshold,
+    /// Minimum planting density (trees per hectare) for large jobs
+    MinDensity,
+    /// Job size threshold (hectares) above which density rules apply
+    JobSizeThreshold,
     /// Per-farmer single-donor escrow record
     Escrow(Address),
     /// Per-tree oracle survival report
@@ -190,18 +229,28 @@ impl TreeEscrow {
     /// * `tree_token` — TREE reward token; the contract must be its admin
     /// * `oracle` — the only address allowed to submit survival reports
     /// * `survival_threshold_percent` — minimum survival rate (0..=100) for Tranche 2 release
+    /// * `min_density` — minimum trees per hectare for jobs above size threshold
+    /// * `job_size_threshold` — minimum job size (hectares) for density rules to apply
     pub fn initialize(
         env: Env,
         admin: Address,
         tree_token: Address,
         oracle: Address,
         survival_threshold_percent: u32,
+        min_density: i128,
+        job_size_threshold: i128,
     ) {
         if env.storage().instance().has(&DataKey::AdminTree) {
             panic!("already initialized");
         }
         if survival_threshold_percent > 100 {
             panic!("survival threshold must be 0..=100");
+        }
+        if min_density <= 0 {
+            panic!("min density must be positive");
+        }
+        if job_size_threshold <= 0 {
+            panic!("job size threshold must be positive");
         }
         if token::StellarAssetClient::new(&env, &tree_token).admin()
             != env.current_contract_address()
@@ -218,6 +267,12 @@ impl TreeEscrow {
         env.storage()
             .instance()
             .set(&DataKey::SurvivalThreshold, &survival_threshold_percent);
+        env.storage()
+            .instance()
+            .set(&DataKey::MinDensity, &min_density);
+        env.storage()
+            .instance()
+            .set(&DataKey::JobSizeThreshold, &job_size_threshold);
     }
 
     // ── Single-donor flow ─────────────────────────────────────────────────────
@@ -230,8 +285,9 @@ impl TreeEscrow {
         token: Address,
         amount: i128,
         tree_count: i128,
+        area_hectares: i128,
     ) {
-        Self::deposit_internal(env, donor, None, farmer, token, amount, tree_count);
+        Self::deposit_internal(env, donor, None, farmer, token, amount, tree_count, area_hectares);
     }
 
     /// Sponsor trees as a gift - NFT receipt and carbon credits go to a different recipient address.
@@ -241,6 +297,7 @@ impl TreeEscrow {
     /// `token` - the token to use for payment (XLM or USDC)
     /// `amount` - the total amount to deposit
     /// `tree_count` - the maximum number of trees covered by this donation
+    /// `area_hectares` - planting area in hectares
     pub fn sponsor_as_gift(
         env: Env,
         donor: Address,
@@ -249,8 +306,9 @@ impl TreeEscrow {
         token: Address,
         amount: i128,
         tree_count: i128,
+        area_hectares: i128,
     ) {
-        Self::deposit_internal(env, donor, Some(recipient_wallet), farmer, token, amount, tree_count);
+        Self::deposit_internal(env, donor, Some(recipient_wallet), farmer, token, amount, tree_count, area_hectares);
     }
 
     fn deposit_internal(
@@ -261,6 +319,7 @@ impl TreeEscrow {
         token: Address,
         amount: i128,
         tree_count: i128,
+        area_hectares: i128,
     ) {
         donor.require_auth();
 
@@ -269,6 +328,19 @@ impl TreeEscrow {
         }
         if tree_count <= 0 {
             panic!("tree count must be positive");
+        }
+        if area_hectares <= 0 {
+            panic!("area hectares must be positive");
+        }
+
+        // Enforce minimum planting density for large jobs
+        let job_size_threshold = Self::job_size_threshold(&env);
+        if area_hectares >= job_size_threshold {
+            let min_density = Self::min_density(&env);
+            let actual_density = tree_count / area_hectares;
+            if actual_density < min_density {
+                panic!("planting density below minimum for job size");
+            }
         }
 
         let key = DataKey::Escrow(farmer.clone());
@@ -289,6 +361,7 @@ impl TreeEscrow {
                 token,
                 total_amount: amount,
                 tree_count,
+                area_hectares,
                 verified_tree_count: 0,
                 tree_tokens_minted: 0,
                 released: 0,
@@ -296,8 +369,9 @@ impl TreeEscrow {
                 status: EscrowStatus::Funded,
                 planted_at: 0,
                 planting_proof: empty_hash.clone(),
-                survival_proof: empty_hash,
+                survival_proof: empty_hash.clone(),
                 survival_rate_percent: 0,
+                year_proof: empty_hash,
             },
         );
 
@@ -306,6 +380,7 @@ impl TreeEscrow {
     }
 
     /// Batch deposit: donor funds N tree slots in a single contract invocation.
+    /// Each slot represents 1 tree on a small area (0.01 hectares for density calculation).
     pub fn batch_deposit(env: Env, donor: Address, token: Address, slots: Vec<BatchSlot>) {
         donor.require_auth();
 
@@ -338,6 +413,10 @@ impl TreeEscrow {
         for i in 0..n {
             let slot = slots.get(i).unwrap();
             let key = DataKey::Escrow(slot.farmer.clone());
+            // Batch deposits use a fixed small area (0.01 hectares) per tree
+            // This ensures batch deposits are exempt from density rules (below threshold)
+            let batch_area_hectares = 1_i128 / 100; // 0.01 hectares per tree
+            
             env.storage().persistent().set(
                 &key,
                 &EscrowRecord {
@@ -347,6 +426,7 @@ impl TreeEscrow {
                     token: token.clone(),
                     total_amount: slot.amount,
                     tree_count: 1,
+                    area_hectares: batch_area_hectares,
                     verified_tree_count: 0,
                     tree_tokens_minted: 0,
                     released: 0,
@@ -356,6 +436,7 @@ impl TreeEscrow {
                     planting_proof: empty_hash.clone(),
                     survival_proof: empty_hash.clone(),
                     survival_rate_percent: 0,
+                    year_proof: empty_hash,
                 },
             );
             env.events()
@@ -365,6 +446,8 @@ impl TreeEscrow {
         env.events().publish((symbol_short!("batch"), donor), total);
     }
 
+    /// Admin-verified planting: releases Tranche 1 (30%) and mints TREE rewards.
+    pub fn verify_planting(
     /// Admin-verified progress update: streams 10% of the escrow to the planter.
     ///
     /// May be called up to 5 times per escrow (each releasing exactly 10% of
@@ -437,6 +520,8 @@ impl TreeEscrow {
             .publish((symbol_short!("progress"), farmer), (rec.progress_updates, stream_amount));
     }
 
+    /// Admin-verified survival check: releases Tranche 2 (40%) once 6 months
+    /// have elapsed and the reported survival rate ≥ the configured threshold.
     /// Admin-verified survival check: releases the remaining escrow once 6 months
     /// have elapsed, all progress updates are completed, and the reported
     /// survival rate ≥ the configured threshold.
@@ -477,7 +562,7 @@ impl TreeEscrow {
             panic!("survival rate below minimum");
         }
 
-        let tranche2 = rec.total_amount - rec.released;
+        let tranche2 = (rec.total_amount * TRANCHE_2_BPS) / BPS_DENOM;
         if tranche2 <= 0 {
             panic!("nothing left to release");
         }
@@ -489,7 +574,7 @@ impl TreeEscrow {
         );
 
         rec.released += tranche2;
-        rec.status = EscrowStatus::Completed;
+        rec.status = EscrowStatus::Survived;
         rec.survival_proof = proof_hash;
         rec.survival_rate_percent = survival_rate_percent;
 
@@ -497,6 +582,53 @@ impl TreeEscrow {
 
         env.events()
             .publish((symbol_short!("survived"), farmer), tranche2);
+    }
+
+    /// Admin-verified 1-year milestone: releases Tranche 3 (30%) once 1 year
+    /// has elapsed since planting.
+    pub fn verify_year_milestone(
+        env: Env,
+        farmer: Address,
+        proof_hash: BytesN<32>,
+    ) {
+        let (admin, _tree_token, _decimals) = Self::admin_tree(&env);
+        admin.require_auth();
+
+        let key = DataKey::Escrow(farmer.clone());
+        let mut rec: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("no escrow for farmer");
+
+        if rec.status != EscrowStatus::Survived {
+            panic!("survival not yet verified");
+        }
+
+        let now = env.ledger().timestamp();
+        if now < rec.planted_at + ONE_YEAR_SECS {
+            panic!("1-year milestone period not yet elapsed");
+        }
+
+        let tranche3 = rec.total_amount - rec.released;
+        if tranche3 <= 0 {
+            panic!("nothing left to release");
+        }
+
+        token::Client::new(&env, &rec.token).transfer(
+            &env.current_contract_address(),
+            &rec.farmer,
+            &tranche3,
+        );
+
+        rec.released += tranche3;
+        rec.status = EscrowStatus::Completed;
+        rec.year_proof = proof_hash;
+
+        env.storage().persistent().set(&key, &rec);
+
+        env.events()
+            .publish((symbol_short!("year_milestone"), farmer), tranche3);
     }
 
     pub fn refund(env: Env, farmer: Address) {
@@ -529,6 +661,80 @@ impl TreeEscrow {
 
     pub fn get_record(env: Env, farmer: Address) -> Option<EscrowRecord> {
         env.storage().persistent().get(&DataKey::Escrow(farmer))
+    }
+
+    // ── Planter rating system (#483) ─────────────────────────────────────────
+
+    /// Sponsor rates a planter after job completion. Rating must be 1-5 stars.
+    /// Only callable by the original donor after escrow is completed.
+    pub fn rate_planter(
+        env: Env,
+        sponsor: Address,
+        farmer: Address,
+        rating: u32,
+    ) {
+        sponsor.require_auth();
+
+        if rating < 1 || rating > 5 {
+            panic!("rating must be between 1 and 5");
+        }
+
+        // Check if escrow exists and is completed
+        let escrow_key = DataKey::Escrow(farmer.clone());
+        let rec: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&escrow_key)
+            .expect("no escrow for farmer");
+
+        if rec.donor != sponsor {
+            panic!("only the original donor can rate the planter");
+        }
+
+        if rec.status != EscrowStatus::Completed {
+            panic!("can only rate after escrow is completed");
+        }
+
+        // Prevent duplicate ratings from same sponsor
+        let rating_key = DataKey::SponsorRating(sponsor.clone(), farmer.clone());
+        if env.storage().persistent().has(&rating_key) {
+            panic!("sponsor has already rated this planter");
+        }
+
+        // Store the individual rating
+        let rating_record = PlanterRating {
+            sponsor: sponsor.clone(),
+            farmer: farmer.clone(),
+            rating,
+            rated_at: env.ledger().timestamp(),
+        };
+        env.storage().persistent().set(&rating_key, &rating_record);
+
+        // Update aggregated reputation
+        let rep_key = DataKey::PlanterReputation(farmer.clone());
+        let mut rep: PlanterReputation = env
+            .storage()
+            .persistent()
+            .get(&rep_key)
+            .unwrap_or(PlanterReputation {
+                farmer: farmer.clone(),
+                total_ratings: 0,
+                sum_ratings: 0,
+                average_rating: 0,
+            });
+
+        rep.total_ratings += 1;
+        rep.sum_ratings += rating as u128;
+        rep.average_rating = (rep.sum_ratings * 20) / rep.total_ratings as u128; // Scale to 0-100 (5 stars * 20 = 100)
+
+        env.storage().persistent().set(&rep_key, &rep);
+
+        env.events()
+            .publish((symbol_short!("rated"), farmer), (sponsor, rating));
+    }
+
+    pub fn get_planter_reputation(env: Env, farmer: Address) -> Option<PlanterReputation> {
+        env.storage().persistent().get(&DataKey::PlanterReputation(farmer))
     }
 
     // ── Oracle survival reports (#394) ────────────────────────────────────────
@@ -1022,6 +1228,8 @@ mod tests {
     };
 
     const DEFAULT_THRESHOLD: u32 = 70;
+    const DEFAULT_MIN_DENSITY: i128 = 1_000;
+    const DEFAULT_JOB_SIZE_THRESHOLD: i128 = 10;
 
     #[allow(dead_code)]
     struct Ctx {
@@ -1040,6 +1248,10 @@ mod tests {
     }
 
     fn setup_with_threshold(threshold: u32) -> Ctx {
+        setup_with_density(threshold, DEFAULT_MIN_DENSITY, DEFAULT_JOB_SIZE_THRESHOLD)
+    }
+
+    fn setup_with_density(threshold: u32, min_density: i128, job_size_threshold: i128) -> Ctx {
         let env = Env::default();
         env.mock_all_auths();
 
@@ -1060,6 +1272,7 @@ mod tests {
             .register_stellar_asset_contract_v2(contract_id.clone())
             .address();
 
+        client.initialize(&admin, &tree_token_id, &oracle, &threshold, &min_density, &job_size_threshold);
         client.initialize(&admin, &tree_token_id, &oracle, &threshold);
         client.add_to_whitelist(&tree_token_id);
         client.add_to_whitelist(&token_id);
@@ -1104,7 +1317,7 @@ mod tests {
             .register_stellar_asset_contract_v2(admin.clone())
             .address();
 
-        client.initialize(&admin, &tree_token_id, &oracle, &70);
+        client.initialize(&admin, &tree_token_id, &oracle, &70, &DEFAULT_MIN_DENSITY, &DEFAULT_JOB_SIZE_THRESHOLD);
     }
 
     #[test]
@@ -1119,7 +1332,7 @@ mod tests {
         let tree_token_id = env
             .register_stellar_asset_contract_v2(contract_id.clone())
             .address();
-        client.initialize(&admin, &tree_token_id, &oracle, &101);
+        client.initialize(&admin, &tree_token_id, &oracle, &101, &DEFAULT_MIN_DENSITY, &DEFAULT_JOB_SIZE_THRESHOLD);
     }
 
     // ── Single-donor lifecycle ────────────────────────────────────────────────
@@ -1130,7 +1343,7 @@ mod tests {
         let stream_10pct = 1_000; // 10% of 10_000
 
         ctx.client
-            .deposit(&ctx.donor, &ctx.farmer, &ctx.token, &10_000, &42);
+            .deposit(&ctx.donor, &ctx.farmer, &ctx.token, &10_000, &42, &5);
         assert_eq!(
             ctx.client.get_record(&ctx.farmer).unwrap().status,
             EscrowStatus::Funded
@@ -1147,6 +1360,7 @@ mod tests {
 
         let rec = ctx.client.get_record(&ctx.farmer).unwrap();
         assert_eq!(rec.status, EscrowStatus::Planted);
+        assert_eq!(rec.released, 3_000); // 30% of 10,000
         assert_eq!(rec.released, 5_000);
         assert_eq!(rec.progress_updates, 5);
         assert_eq!(rec.tree_count, 42);
@@ -1166,9 +1380,19 @@ mod tests {
         ctx.client
             .verify_survival(&ctx.farmer, &proof(&ctx.env, 6), &70);
         let rec = ctx.client.get_record(&ctx.farmer).unwrap();
-        assert_eq!(rec.status, EscrowStatus::Completed);
-        assert_eq!(rec.released, 10_000);
+        assert_eq!(rec.status, EscrowStatus::Survived);
+        assert_eq!(rec.released, 7_000); // 30% + 40% = 70%
         assert_eq!(rec.survival_rate_percent, 70);
+
+        ctx.env
+            .ledger()
+            .with_mut(|l| l.timestamp += ONE_YEAR_SECS - SIX_MONTHS_SECS + 1);
+
+        ctx.client
+            .verify_year_milestone(&ctx.farmer, &proof(&ctx.env, 3));
+        let rec = ctx.client.get_record(&ctx.farmer).unwrap();
+        assert_eq!(rec.status, EscrowStatus::Completed);
+        assert_eq!(rec.released, 10_000); // 100%
     }
 
     #[test]
@@ -1176,6 +1400,9 @@ mod tests {
     fn test_survival_too_early_rejected() {
         let ctx = setup();
         ctx.client
+            .deposit(&ctx.donor, &ctx.farmer, &ctx.token, &10_000, &42, &5);
+        ctx.client
+            .verify_planting(&ctx.farmer, &proof(&ctx.env, 1), &42);
             .deposit(&ctx.donor, &ctx.farmer, &ctx.token, &10_000, &42);
         for i in 0..5 {
             ctx.client
@@ -1191,6 +1418,9 @@ mod tests {
     fn test_survival_below_threshold_rejected() {
         let ctx = setup();
         ctx.client
+            .deposit(&ctx.donor, &ctx.farmer, &ctx.token, &10_000, &42, &5);
+        ctx.client
+            .verify_planting(&ctx.farmer, &proof(&ctx.env, 1), &42);
             .deposit(&ctx.donor, &ctx.farmer, &ctx.token, &10_000, &42);
         for i in 0..5 {
             ctx.client
@@ -1208,6 +1438,9 @@ mod tests {
         // Lower the threshold to 50 — survival of 55% must now succeed.
         let ctx = setup_with_threshold(50);
         ctx.client
+            .deposit(&ctx.donor, &ctx.farmer, &ctx.token, &10_000, &42, &5);
+        ctx.client
+            .verify_planting(&ctx.farmer, &proof(&ctx.env, 1), &42);
             .deposit(&ctx.donor, &ctx.farmer, &ctx.token, &10_000, &42);
         for i in 0..5 {
             ctx.client
@@ -1217,6 +1450,15 @@ mod tests {
             .ledger()
             .with_mut(|l| l.timestamp += SIX_MONTHS_SECS + 1);
         ctx.client
+            .verify_survival(&ctx.farmer, &proof(&ctx.env, 2), &55);
+        let rec = ctx.client.get_record(&ctx.farmer).unwrap();
+        assert_eq!(rec.status, EscrowStatus::Survived);
+        
+        ctx.env
+            .ledger()
+            .with_mut(|l| l.timestamp += ONE_YEAR_SECS - SIX_MONTHS_SECS + 1);
+        ctx.client
+            .verify_year_milestone(&ctx.farmer, &proof(&ctx.env, 3));
             .verify_survival(&ctx.farmer, &proof(&ctx.env, 6), &55);
         assert_eq!(
             ctx.client.get_record(&ctx.farmer).unwrap().status,
@@ -1229,6 +1471,7 @@ mod tests {
     fn test_extra_progress_rejected() {
         let ctx = setup();
         ctx.client
+            .deposit(&ctx.donor, &ctx.farmer, &ctx.token, &10_000, &42, &5);
             .deposit(&ctx.donor, &ctx.farmer, &ctx.token, &10_000, &42);
         for i in 0..5 {
             ctx.client
@@ -1243,7 +1486,7 @@ mod tests {
     fn test_refund_before_planting() {
         let ctx = setup();
         ctx.client
-            .deposit(&ctx.donor, &ctx.farmer, &ctx.token, &10_000, &42);
+            .deposit(&ctx.donor, &ctx.farmer, &ctx.token, &10_000, &42, &5);
         ctx.client.refund(&ctx.farmer);
         assert_eq!(
             ctx.client.get_record(&ctx.farmer).unwrap().status,
@@ -1256,7 +1499,7 @@ mod tests {
     fn test_refund_after_progress_rejected() {
         let ctx = setup();
         ctx.client
-            .deposit(&ctx.donor, &ctx.farmer, &ctx.token, &10_000, &42);
+            .deposit(&ctx.donor, &ctx.farmer, &ctx.token, &10_000, &42, &5);
         ctx.client
             .verify_progress(&ctx.farmer, &proof(&ctx.env, 1), &42);
         ctx.client.refund(&ctx.farmer);
@@ -1267,14 +1510,297 @@ mod tests {
     fn test_deposit_rejects_zero_tree_count() {
         let ctx = setup();
         ctx.client
-            .deposit(&ctx.donor, &ctx.farmer, &ctx.token, &10_000, &0);
+            .deposit(&ctx.donor, &ctx.farmer, &ctx.token, &10_000, &0, &5);
+    }
+
+    // ── 1-year milestone tests (#494) ───────────────────────────────────────────
+
+    #[test]
+    #[should_panic(expected = "survival not yet verified")]
+    fn test_year_milestone_before_survival_rejected() {
+        let ctx = setup();
+        ctx.client
+            .deposit(&ctx.donor, &ctx.farmer, &ctx.token, &10_000, &42, &5);
+        ctx.client
+            .verify_planting(&ctx.farmer, &proof(&ctx.env, 1), &42);
+        ctx.env
+            .ledger()
+            .with_mut(|l| l.timestamp += ONE_YEAR_SECS + 1);
+        ctx.client
+            .verify_year_milestone(&ctx.farmer, &proof(&ctx.env, 2));
+    }
+
+    #[test]
+    #[should_panic(expected = "1-year milestone period not yet elapsed")]
+    fn test_year_milestone_too_early_rejected() {
+        let ctx = setup();
+        ctx.client
+            .deposit(&ctx.donor, &ctx.farmer, &ctx.token, &10_000, &42, &5);
+        ctx.client
+            .verify_planting(&ctx.farmer, &proof(&ctx.env, 1), &42);
+        ctx.env
+            .ledger()
+            .with_mut(|l| l.timestamp += SIX_MONTHS_SECS + 1);
+        ctx.client
+            .verify_survival(&ctx.farmer, &proof(&ctx.env, 2), &70);
+        ctx.env.ledger().with_mut(|l| l.timestamp += 86_400);
+        ctx.client
+            .verify_year_milestone(&ctx.farmer, &proof(&ctx.env, 3));
+    }
+
+    #[test]
+    fn test_year_milestone_at_one_year_accepted() {
+        let ctx = setup();
+        ctx.client
+            .deposit(&ctx.donor, &ctx.farmer, &ctx.token, &10_000, &42, &5);
+        ctx.client
+            .verify_planting(&ctx.farmer, &proof(&ctx.env, 1), &42);
+        ctx.env
+            .ledger()
+            .with_mut(|l| l.timestamp += SIX_MONTHS_SECS + 1);
+        ctx.client
+            .verify_survival(&ctx.farmer, &proof(&ctx.env, 2), &70);
+        ctx.env
+            .ledger()
+            .with_mut(|l| l.timestamp += ONE_YEAR_SECS - SIX_MONTHS_SECS + 1);
+        ctx.client
+            .verify_year_milestone(&ctx.farmer, &proof(&ctx.env, 3));
+        assert_eq!(
+            ctx.client.get_record(&ctx.farmer).unwrap().status,
+            EscrowStatus::Completed
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "nothing left to release")]
+    fn test_year_milestone_double_call_rejected() {
+        let ctx = setup();
+        ctx.client
+            .deposit(&ctx.donor, &ctx.farmer, &ctx.token, &10_000, &42, &5);
+        ctx.client
+            .verify_planting(&ctx.farmer, &proof(&ctx.env, 1), &42);
+        ctx.env
+            .ledger()
+            .with_mut(|l| l.timestamp += SIX_MONTHS_SECS + 1);
+        ctx.client
+            .verify_survival(&ctx.farmer, &proof(&ctx.env, 2), &70);
+        ctx.env
+            .ledger()
+            .with_mut(|l| l.timestamp += ONE_YEAR_SECS - SIX_MONTHS_SECS + 1);
+        ctx.client
+            .verify_year_milestone(&ctx.farmer, &proof(&ctx.env, 3));
+        ctx.client
+            .verify_year_milestone(&ctx.farmer, &proof(&ctx.env, 4));
+    }
+
+    // ── Planter rating tests (#483) ───────────────────────────────────────────
+
+    #[test]
+    fn test_rate_planter_after_completion() {
+        let ctx = setup();
+        ctx.client
+            .deposit(&ctx.donor, &ctx.farmer, &ctx.token, &10_000, &42, &5);
+        ctx.client
+            .verify_planting(&ctx.farmer, &proof(&ctx.env, 1), &42);
+        ctx.env
+            .ledger()
+            .with_mut(|l| l.timestamp += SIX_MONTHS_SECS + 1);
+        ctx.client
+            .verify_survival(&ctx.farmer, &proof(&ctx.env, 2), &70);
+        ctx.env
+            .ledger()
+            .with_mut(|l| l.timestamp += ONE_YEAR_SECS - SIX_MONTHS_SECS + 1);
+        ctx.client
+            .verify_year_milestone(&ctx.farmer, &proof(&ctx.env, 3));
+
+        ctx.client.rate_planter(&ctx.donor, &ctx.farmer, &5);
+
+        let rep = ctx.client.get_planter_reputation(&ctx.farmer).unwrap();
+        assert_eq!(rep.total_ratings, 1);
+        assert_eq!(rep.sum_ratings, 5);
+        assert_eq!(rep.average_rating, 100); // 5 * 20 = 100
+    }
+
+    #[test]
+    #[should_panic(expected = "rating must be between 1 and 5")]
+    fn test_rating_out_of_range_rejected() {
+        let ctx = setup();
+        ctx.client
+            .deposit(&ctx.donor, &ctx.farmer, &ctx.token, &10_000, &42, &5);
+        ctx.client
+            .verify_planting(&ctx.farmer, &proof(&ctx.env, 1), &42);
+        ctx.env
+            .ledger()
+            .with_mut(|l| l.timestamp += SIX_MONTHS_SECS + 1);
+        ctx.client
+            .verify_survival(&ctx.farmer, &proof(&ctx.env, 2), &70);
+        ctx.env
+            .ledger()
+            .with_mut(|l| l.timestamp += ONE_YEAR_SECS - SIX_MONTHS_SECS + 1);
+        ctx.client
+            .verify_year_milestone(&ctx.farmer, &proof(&ctx.env, 3));
+
+        ctx.client.rate_planter(&ctx.donor, &ctx.farmer, &6);
+    }
+
+    #[test]
+    #[should_panic(expected = "can only rate after escrow is completed")]
+    fn test_rating_before_completion_rejected() {
+        let ctx = setup();
+        ctx.client
+            .deposit(&ctx.donor, &ctx.farmer, &ctx.token, &10_000, &42, &5);
+        ctx.client
+            .verify_planting(&ctx.farmer, &proof(&ctx.env, 1), &42);
+
+        ctx.client.rate_planter(&ctx.donor, &ctx.farmer, &5);
+    }
+
+    #[test]
+    #[should_panic(expected = "only the original donor can rate the planter")]
+    fn test_non_donor_cannot_rate() {
+        let ctx = setup();
+        let impostor = Address::generate(&ctx.env);
+        ctx.client
+            .deposit(&ctx.donor, &ctx.farmer, &ctx.token, &10_000, &42, &5);
+        ctx.client
+            .verify_planting(&ctx.farmer, &proof(&ctx.env, 1), &42);
+        ctx.env
+            .ledger()
+            .with_mut(|l| l.timestamp += SIX_MONTHS_SECS + 1);
+        ctx.client
+            .verify_survival(&ctx.farmer, &proof(&ctx.env, 2), &70);
+        ctx.env
+            .ledger()
+            .with_mut(|l| l.timestamp += ONE_YEAR_SECS - SIX_MONTHS_SECS + 1);
+        ctx.client
+            .verify_year_milestone(&ctx.farmer, &proof(&ctx.env, 3));
+
+        ctx.client.rate_planter(&impostor, &ctx.farmer, &5);
+    }
+
+    #[test]
+    #[should_panic(expected = "sponsor has already rated this planter")]
+    fn test_duplicate_rating_rejected() {
+        let ctx = setup();
+        ctx.client
+            .deposit(&ctx.donor, &ctx.farmer, &ctx.token, &10_000, &42, &5);
+        ctx.client
+            .verify_planting(&ctx.farmer, &proof(&ctx.env, 1), &42);
+        ctx.env
+            .ledger()
+            .with_mut(|l| l.timestamp += SIX_MONTHS_SECS + 1);
+        ctx.client
+            .verify_survival(&ctx.farmer, &proof(&ctx.env, 2), &70);
+        ctx.env
+            .ledger()
+            .with_mut(|l| l.timestamp += ONE_YEAR_SECS - SIX_MONTHS_SECS + 1);
+        ctx.client
+            .verify_year_milestone(&ctx.farmer, &proof(&ctx.env, 3));
+
+        ctx.client.rate_planter(&ctx.donor, &ctx.farmer, &5);
+        ctx.client.rate_planter(&ctx.donor, &ctx.farmer, &4);
+    }
+
+    #[test]
+    fn test_multiple_sponsors_can_rate_same_planter() {
+        let ctx = setup();
+        ctx.client
+            .deposit(&ctx.donor, &ctx.farmer, &ctx.token, &10_000, &42, &5);
+        ctx.client
+            .verify_planting(&ctx.farmer, &proof(&ctx.env, 1), &42);
+        ctx.env
+            .ledger()
+            .with_mut(|l| l.timestamp += SIX_MONTHS_SECS + 1);
+        ctx.client
+            .verify_survival(&ctx.farmer, &proof(&ctx.env, 2), &70);
+        ctx.env
+            .ledger()
+            .with_mut(|l| l.timestamp += ONE_YEAR_SECS - SIX_MONTHS_SECS + 1);
+        ctx.client
+            .verify_year_milestone(&ctx.farmer, &proof(&ctx.env, 3));
+
+        // First sponsor rates
+        ctx.client.rate_planter(&ctx.donor, &ctx.farmer, &5);
+
+        // Create a second escrow with different donor
+        let donor2 = Address::generate(&ctx.env);
+        token::StellarAssetClient::new(&ctx.env, &ctx.token).mint(&donor2, &10_000);
+        let farmer2 = ctx.farmer.clone(); // Same farmer
+        ctx.client
+            .deposit(&donor2, &farmer2, &ctx.token, &10_000, &30, &3);
+        ctx.client
+            .verify_planting(&farmer2, &proof(&ctx.env, 2), &30);
+        ctx.env
+            .ledger()
+            .with_mut(|l| l.timestamp += SIX_MONTHS_SECS + 1);
+        ctx.client
+            .verify_survival(&farmer2, &proof(&ctx.env, 3), &70);
+        ctx.env
+            .ledger()
+            .with_mut(|l| l.timestamp += ONE_YEAR_SECS - SIX_MONTHS_SECS + 1);
+        ctx.client
+            .verify_year_milestone(&farmer2, &proof(&ctx.env, 4));
+
+        // Second sponsor rates
+        ctx.client.rate_planter(&donor2, &farmer2, &4);
+
+        let rep = ctx.client.get_planter_reputation(&ctx.farmer).unwrap();
+        assert_eq!(rep.total_ratings, 2);
+        assert_eq!(rep.sum_ratings, 9); // 5 + 4
+        assert_eq!(rep.average_rating, 90); // (9 * 20) / 2 = 90
+    }
+
+    #[test]
+    fn test_reputation_calculation_with_various_ratings() {
+        let ctx = setup();
+        ctx.client
+            .deposit(&ctx.donor, &ctx.farmer, &ctx.token, &10_000, &42, &5);
+        ctx.client
+            .verify_planting(&ctx.farmer, &proof(&ctx.env, 1), &42);
+        ctx.env
+            .ledger()
+            .with_mut(|l| l.timestamp += SIX_MONTHS_SECS + 1);
+        ctx.client
+            .verify_survival(&ctx.farmer, &proof(&ctx.env, 2), &70);
+        ctx.env
+            .ledger()
+            .with_mut(|l| l.timestamp += ONE_YEAR_SECS - SIX_MONTHS_SECS + 1);
+        ctx.client
+            .verify_year_milestone(&ctx.farmer, &proof(&ctx.env, 3));
+
+        // Add multiple ratings from different sponsors
+        for i in 1..=5 {
+            let donor = Address::generate(&ctx.env);
+            token::StellarAssetClient::new(&ctx.env, &ctx.token).mint(&donor, &10_000);
+            let farmer = ctx.farmer.clone();
+            ctx.client
+                .deposit(&donor, &farmer, &ctx.token, &10_000, &10, &1);
+            ctx.client
+                .verify_planting(&farmer, &proof(&ctx.env, i + 10), &10);
+            ctx.env
+                .ledger()
+                .with_mut(|l| l.timestamp += SIX_MONTHS_SECS + 1);
+            ctx.client
+                .verify_survival(&farmer, &proof(&ctx.env, i + 20), &70);
+            ctx.env
+                .ledger()
+                .with_mut(|l| l.timestamp += ONE_YEAR_SECS - SIX_MONTHS_SECS + 1);
+            ctx.client
+                .verify_year_milestone(&farmer, &proof(&ctx.env, i + 30));
+            ctx.client.rate_planter(&donor, &farmer, i);
+        }
+
+        let rep = ctx.client.get_planter_reputation(&ctx.farmer).unwrap();
+        assert_eq!(rep.total_ratings, 5);
+        assert_eq!(rep.sum_ratings, 15); // 1+2+3+4+5
+        assert_eq!(rep.average_rating, 60); // (15 * 20) / 5 = 60
     }
 
     #[test]
     fn test_verified_tree_count_controls_tree_mint_amount() {
         let ctx = setup();
         ctx.client
-            .deposit(&ctx.donor, &ctx.farmer, &ctx.token, &10_000, &42);
+            .deposit(&ctx.donor, &ctx.farmer, &ctx.token, &10_000, &42, &5);
         ctx.client
             .verify_progress(&ctx.farmer, &proof(&ctx.env, 1), &30);
 
@@ -1289,9 +1815,84 @@ mod tests {
     fn test_verified_tree_count_cannot_exceed_donation() {
         let ctx = setup();
         ctx.client
-            .deposit(&ctx.donor, &ctx.farmer, &ctx.token, &10_000, &42);
+            .deposit(&ctx.donor, &ctx.farmer, &ctx.token, &10_000, &42, &5);
         ctx.client
             .verify_progress(&ctx.farmer, &proof(&ctx.env, 1), &43);
+    }
+
+    // ── Planting density tests (#514) ───────────────────────────────────────────
+
+    #[test]
+    fn test_small_job_exempt_from_density_rules() {
+        // Job size (5 hectares) is below threshold (10 hectares)
+        let ctx = setup();
+        ctx.client
+            .deposit(&ctx.donor, &ctx.farmer, &ctx.token, &10_000, &100, &5);
+        // Density = 100/5 = 20 trees/hectare, which is below min_density (1000)
+        // But since job is small, it should be accepted
+        assert_eq!(
+            ctx.client.get_record(&ctx.farmer).unwrap().status,
+            EscrowStatus::Funded
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "planting density below minimum for job size")]
+    fn test_large_job_below_minimum_density_rejected() {
+        // Job size (10 hectares) meets threshold
+        // Density must be >= 1000 trees/hectare
+        let ctx = setup();
+        // 5000 trees / 10 hectares = 500 trees/hectare (below 1000 minimum)
+        ctx.client
+            .deposit(&ctx.donor, &ctx.farmer, &ctx.token, &10_000, &5_000, &10);
+    }
+
+    #[test]
+    fn test_large_job_at_minimum_density_accepted() {
+        // Job size (10 hectares) meets threshold
+        // Density = 10000 trees / 10 hectares = 1000 trees/hectare (meets minimum)
+        let ctx = setup();
+        ctx.client
+            .deposit(&ctx.donor, &ctx.farmer, &ctx.token, &10_000, &10_000, &10);
+        assert_eq!(
+            ctx.client.get_record(&ctx.farmer).unwrap().status,
+            EscrowStatus::Funded
+        );
+    }
+
+    #[test]
+    fn test_large_job_above_minimum_density_accepted() {
+        // Job size (10 hectares) meets threshold
+        // Density = 15000 trees / 10 hectares = 1500 trees/hectare (above minimum)
+        let ctx = setup();
+        ctx.client
+            .deposit(&ctx.donor, &ctx.farmer, &ctx.token, &10_000, &15_000, &10);
+        assert_eq!(
+            ctx.client.get_record(&ctx.farmer).unwrap().status,
+            EscrowStatus::Funded
+        );
+    }
+
+    #[test]
+    fn test_custom_density_threshold() {
+        // Test with custom density threshold of 500 trees/hectare
+        let ctx = setup_with_density(70, 500, 5);
+        // Job size (5 hectares) meets custom threshold
+        // Density = 2000 trees / 5 hectares = 400 trees/hectare (below 500 minimum)
+        ctx.client
+            .deposit(&ctx.donor, &ctx.farmer, &ctx.token, &10_000, &2_000, &5);
+        assert_eq!(
+            ctx.client.get_record(&ctx.farmer).unwrap().status,
+            EscrowStatus::Funded
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "area hectares must be positive")]
+    fn test_deposit_rejects_zero_area() {
+        let ctx = setup();
+        ctx.client
+            .deposit(&ctx.donor, &ctx.farmer, &ctx.token, &10_000, &42, &0);
     }
 
     #[test]
@@ -1643,3 +2244,18 @@ mod tests {
         }
     }
 }
+
+    fn min_density(env: &Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MinDensity)
+            .expect(" not initialized\)
+ }
+
+ fn job_size_threshold(env: &Env) -> i128 {
+ env.storage()
+ .instance()
+ .get(&DataKey::JobSizeThreshold)
+ .expect(\not initialized\)
+ }
+
